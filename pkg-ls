@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -e
+
+run_pkg_ls() {
+  local FORMAT="pretty"
+  local TARGET="."
+  local SHOW_HIDDEN=false
+
+  # 1. Parsing de Argumentos
+  local ARGS=()
+  while [[ "$#" -gt 0 ]]; do
+    case $1 in
+      -f|--format) FORMAT="$2"; shift ;;
+      -a|--all)    SHOW_HIDDEN=true ;;
+      *)            ARGS+=("$1") ;;
+    esac
+    shift
+  done
+
+  [ ${#ARGS[@]} -gt 0 ] && TARGET="${ARGS[0]}"
+  
+  local START_DIR=$(pwd)
+  if [[ ! -d "$TARGET" ]]; then
+    echo "❌ Erro: Diretório '$TARGET' não encontrado."
+    exit 1
+  fi
+  local TARGET_ABS=$(cd "$TARGET" && pwd)
+
+  # 2. Configuração de Busca (Removido maxdepth para ser total)
+  local FIND_OPTS=""
+  [ "$SHOW_HIDDEN" = false ] && FIND_OPTS="-not -path '*/.*'"
+  
+  # Busca todos os composer.json ignorando vendor
+  local FILES=$(eval "find \"$TARGET_ABS\" -name 'composer.json' -not -path '*/vendor/*' $FIND_OPTS | sort")
+
+  if [ -z "$FILES" ]; then
+    echo "℄ Nenhum pacote encontrado."
+    return 0
+  fi
+
+  local DATA_JSON="[]"
+  local W_PRJ=25; local W_NS=30; local W_REL=25; local W_ABS=64; local W_GIT=64
+
+  if [[ "$FORMAT" == "pretty" ]]; then
+    echo -e "\033[0;36m℄ Package Inspector: $TARGET_ABS\033[0m"
+    printf "\033[0;90m%-*s | %-*s | %-*s | %-*s | %-*s\033[0m\n" \
+      $W_PRJ "PROJECT" $W_NS "NAMESPACE" $W_REL "RELATIVE" $W_ABS "ABSOLUTE PATH" $W_GIT "GIT REPO"
+    local LINE_LEN=$((W_PRJ + W_NS + W_REL + W_ABS + W_GIT + 12))
+    printf '%.0s-' $(seq 1 $LINE_LEN); echo ""
+  fi
+
+  while read -r composer_file; do
+    local abs_dir=$(dirname "$composer_file")
+    local name=$(jq -r '.name // "n/a"' "$composer_file")
+    local ns=$(jq -r '.autoload["psr-4"] // {} | keys[0] // "n/a"' "$composer_file" | sed 's/\\$//')
+    local rel_path=$(realpath --relative-to="$START_DIR" "$abs_dir")
+
+    local git_url="none"
+    if [[ -d "$abs_dir/.git" ]]; then
+       git_url=$(cd "$abs_dir" && git remote get-url origin 2>/dev/null || \
+                 cd "$abs_dir" && git remote -v | head -n1 | awk '{print $2}' 2>/dev/null)
+       [[ -z "$git_url" ]] && git_url="local-repo"
+    fi
+
+    case "$FORMAT" in
+      json)
+        DATA_JSON=$(jq -n --argjson list "$DATA_JSON" --arg name "$name" --arg ns "$ns" \
+                          --arg rel "$rel_path" --arg abs "$abs_dir" --arg git "$git_url" \
+                    '$list + [{"project": $name, "namespace": $ns, "relative": $rel, "absolute": $abs, "git": $git}]')
+        ;;
+      csv) echo "$name,$ns,$rel_path,$abs_dir,$git_url" ;;
+      *)
+        truncate_str() {
+          local str="$1"; local max=$2
+          [ ${#str} -gt $max ] && echo "${str:0:$((max-3))}..." || echo "$str"
+        }
+        printf "%-*s | %-*s | %-*s | %-*s | %-*s\n" \
+          $W_PRJ "$(truncate_str "$name" $W_PRJ)" $W_NS "$(truncate_str "$ns" $W_NS)" \
+          $W_REL "$(truncate_str "$rel_path" $W_REL)" $W_ABS "$(truncate_str "$abs_dir" $W_ABS)" \
+          $W_GIT "$(truncate_str "$git_url" $W_GIT)"
+        ;;
+    esac
+  done <<< "$FILES"
+
+  [ "$FORMAT" == "json" ] && echo "$DATA_JSON"
+}
+
+run_pkg_ls "$@"
