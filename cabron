@@ -1,0 +1,173 @@
+#!/bin/bash
+COPY_TO_CLIPBOARD=false
+FILE_TYPE=""
+
+# Parse das flags
+while [[ "$1" == -* ]]; do
+  case "$1" in
+    -c|--clip)
+      COPY_TO_CLIPBOARD=true
+      shift
+      ;;
+    -t|--type)
+      FILE_TYPE="$2"
+      shift 2
+      ;;
+    *)
+      echo "[cabron] flag desconhecida: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# Se especificou tipo, processa arquivos desse tipo no diretório atual
+if [ -n "$FILE_TYPE" ]; then
+  if [ ! -d "." ]; then
+    echo "[cabron] diretório atual inválido"
+    exit 1
+  fi
+  
+  OUTPUT=$(
+    echo "[cabron][type=$FILE_TYPE][begin]"
+    
+    find . -name "*.$FILE_TYPE" -not -path "*/vendor/*" | sort | while read -r FILE; do
+      case "$FILE_TYPE" in
+        php)
+          echo -n "[$FILE]" && php -w "$FILE" | tr -d '\n'
+          ;;
+        css)
+          echo -n "[$FILE]" && css -w "$FILE"
+          ;;
+        js)
+          echo -n "[$FILE]" && js -w "$FILE"
+          ;;
+        *)
+          echo -n "[$FILE]" && cat "$FILE" | tr -d '\n'
+          ;;
+      esac
+      echo ""
+    done
+    
+    echo "[cabron][end]"
+  )
+  
+  if [ "$COPY_TO_CLIPBOARD" == true ]; then
+    echo -n "$OUTPUT" | xclip -selection clipboard
+    echo "[cabron] copiado ($FILE_TYPE)"
+  else
+    echo "$OUTPUT"
+  fi
+  exit 0
+fi
+
+# Modo normal - precisa de argumentos
+if [ "$#" -lt 1 ]; then
+  echo "[cabron] uso: cabron [-c|--clip] [-t|--type ext] /dir1 /arquivo.php [/dir2 ...]"
+  exit 1
+fi
+
+OUTPUT=$(
+for TARGET in "$@"; do
+  # Arquivo individual .php
+  if [ -f "$TARGET" ] && [[ "$TARGET" == *.php ]]; then
+    echo "[cabron][file]"
+    echo -n "[$TARGET]" && php -w "$TARGET" | tr -d '\n'
+    echo "[cabron][end]"
+    continue
+  fi
+
+  # Arquivo individual .css
+  if [ -f "$TARGET" ] && [[ "$TARGET" == *.css ]]; then
+    echo "[cabron][file]"
+    echo -n "[$TARGET]" && css -w "$TARGET"
+    echo "[cabron][end]"
+    continue
+  fi
+
+  # Arquivo individual .js
+  if [ -f "$TARGET" ] && [[ "$TARGET" == *.js ]]; then
+    echo "[cabron][file]"
+    echo -n "[$TARGET]" && js -w "$TARGET"
+    echo "[cabron][end]"
+    continue
+  fi
+  
+  if [ ! -d "$TARGET" ]; then
+    echo "[cabron] item inválido: $TARGET"
+    continue
+  fi
+  
+  DIR="$TARGET"
+  COMPOSER="$(find "$DIR" -maxdepth 2 -name composer.json -print -quit)"
+  
+  if [ -z "$COMPOSER" ]; then
+    echo "[cabron] composer.json não encontrado em: $DIR"
+    continue
+  fi
+  
+  PACKAGE_NAME=$(jq -r '.name' "$COMPOSER" 2>/dev/null)
+  [ "$PACKAGE_NAME" == "null" ] && PACKAGE_NAME="unknown/package"
+  NAMESPACE=$(jq -r '.autoload["psr-4"] | to_entries[0].key' "$COMPOSER" 2>/dev/null)
+  [ "$NAMESPACE" == "null" ] && NAMESPACE="\\"
+  
+  # Contar arquivos PHP
+  FILE_COUNT=$(find "$DIR" -name "*.php" -not -path "*/vendor/*" | wc -l)
+  
+  # Detectar README
+  HAS_README="false"
+  if [ -f "$DIR/README.md" ]; then
+    HAS_README="true"
+  fi
+  
+  # Git remote
+  GIT_REMOTE=$(git -C "$DIR" config --get remote.origin.url 2>/dev/null)
+  
+  # Parse .env.example
+  ENV_LINE=""
+  if [ -f "$DIR/.env.example" ]; then
+    ENV_LINE=$(cat "$DIR/.env.example" | grep -v '^#' | grep -v '^\s*$' | grep '=' | tr '\n' ';' | sed 's/;$//')
+  fi
+  
+  echo "[cabron][begin]"
+  echo -n "[@package_name($PACKAGE_NAME)@namespace($NAMESPACE)@files($FILE_COUNT)@has_readme($HAS_README)"
+  
+  # Git remote
+  if [ -n "$GIT_REMOTE" ]; then
+    echo -n "@remote($GIT_REMOTE)"
+  fi
+  
+  # Env
+  if [ -n "$ENV_LINE" ]; then
+    echo -n "@env($ENV_LINE)"
+  fi
+  echo "]"
+  
+  # Executáveis PHP (#!/usr/bin/env php sem extensão .php)
+  if [ -d "$DIR/bin" ]; then
+    find "$DIR/bin" -type f -executable -not -name "*.php" 2>/dev/null | sort | while read -r EXEC; do
+      if head -n 1 "$EXEC" 2>/dev/null | grep -q '#!/usr/bin/env php'; then
+        echo -n "[$EXEC]" && php -w "$EXEC" | tr -d '\n'
+        echo ""
+      fi
+    done
+  fi
+  
+  # Arquivos .php normais
+  find "$DIR" -name "*.php" -not -path "*/vendor/*" | sort | while read -r FILE; do
+    echo -n "[$FILE]" && php -w "$FILE" | tr -d '\n'
+    echo ""
+  done
+  
+  # Composer
+  echo -n "[$COMPOSER]"
+  jq -c '.' "$COMPOSER" 2>/dev/null || cat "$COMPOSER" | tr -d '\n'
+  echo "[cabron][end]"
+done
+)
+
+if [ "$COPY_TO_CLIPBOARD" == true ]; then
+  echo -n "$OUTPUT" | xclip -selection clipboard
+  echo "[cabron] copiado"
+else
+  echo "$OUTPUT"
+fi
