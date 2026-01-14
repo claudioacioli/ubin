@@ -1,0 +1,1359 @@
+#!/usr/bin/env bash
+set -e
+
+# ============================================================
+# ENTITY CLI - Gerador de Entidades
+# ============================================================
+
+WORK_DIR="$(pwd)"
+
+# ============================================================
+# HELP
+# ============================================================
+
+show_help() {
+  echo "ENTITY - Gerador de Entidades"
+  echo ""
+  echo "uso:"
+  echo "  entity name:<name>:<namespace> props:\"<props>\" [destino]"
+  echo "  entity test <path>"
+  echo ""
+  echo "props format:"
+  echo "  Encapsulamento: - (private), ~ (protected, default), + (public)"
+  echo "  Nullable: ? antes do tipo"
+  echo "  Tipo maiúsculo = Element, minúsculo = primitivo"
+  echo ""
+  echo "  Integral:  \"email:?Email\" → protected ?Email \$email"
+  echo "  Shorthand: \"?Email\" → protected ?Email \$email"
+  echo "  Shorthand: \"?email\" → protected ?string \$email"
+  echo "  Visibility: \"-?Email\" → private ?Email \$email"
+  echo ""
+  echo "exemplo:"
+  echo "  entity name:ecpf:eCPF props:\"Id|Id:pessoa_fisica_id|?Email|?Name:nome_titular\" ./entities"
+  echo ""
+  echo "variáveis de ambiente:"
+  echo "  ENTITY_OUTPUT   diretório padrão para entidades"
+  echo ""
+  echo "requer: recompose, pkg-ls no PATH"
+}
+
+cleanup_and_exit() {
+  local msg="$1"
+  local path="$2"
+  echo "❌ $msg"
+  if [[ -n "$path" && -d "$path" ]]; then
+    rm -rf "$path"
+    echo "🧹 Removido: $path"
+  fi
+  exit 1
+}
+
+# ============================================================
+# TEST
+# ============================================================
+
+run_test() {
+  local ENT_PATH="$1"
+
+  [[ -z "$ENT_PATH" ]] && exit 1
+  [[ ! -d "$ENT_PATH" ]] && exit 1
+  [[ ! -f "$ENT_PATH/test.php" ]] && exit 1
+
+  echo "🧪 Testando entidade: $ENT_PATH"
+  echo ""
+
+  (cd "$ENT_PATH" && php test.php)
+}
+
+# ============================================================
+# PARSER DE PROPRIEDADES
+# ============================================================
+
+declare -a PROP_NAMES=()
+declare -a PROP_TYPES=()
+declare -a PROP_VISIBILITIES=()
+declare -a PROP_NULLABLES=()
+declare -a PROP_IS_ELEMENT=()
+declare -a ELEMENT_TYPES=()
+
+reset_props() {
+  PROP_NAMES=()
+  PROP_TYPES=()
+  PROP_VISIBILITIES=()
+  PROP_NULLABLES=()
+  PROP_IS_ELEMENT=()
+  ELEMENT_TYPES=()
+}
+
+parse_props() {
+  IFS='|' read -ra PROPS <<< "$1"
+  for prop in "${PROPS[@]}"; do
+    parse_single_prop "$prop"
+  done
+}
+
+parse_single_prop() {
+  local prop="$(echo "$1" | xargs)"
+  local visibility="protected"
+  local nullable=""
+  local type=""
+  local name=""
+  local is_element="false"
+
+  case "${prop:0:1}" in
+    "-") visibility="private"; prop="${prop:1}" ;;
+    "+") visibility="public";  prop="${prop:1}" ;;
+    "~") visibility="protected"; prop="${prop:1}" ;;
+  esac
+
+  [[ "${prop:0:1}" == "?" ]] && nullable="?" && prop="${prop:1}"
+
+  if [[ "$prop" == *":"* ]]; then
+    local a="${prop%%:*}"
+    local b="${prop#*:}"
+
+    if [[ "${a:0:1}" =~ [A-Z] ]] || [[ "$a" =~ ^(string|int|bool|float|array|mixed)$ ]]; then
+      type="$a"; name="$b"
+    else
+      name="$a"; type="$b"
+      [[ "${type:0:1}" == "?" ]] && nullable="?" && type="${type:1}"
+    fi
+  else
+    type="$prop"
+  fi
+
+  if [[ "${type:0:1}" =~ [A-Z] ]]; then
+    is_element="true"
+    [[ -z "$name" ]] && name=$(echo "$type" | sed 's/\([A-Z]\)/_\L\1/g' | sed 's/^_//')
+  else
+    is_element="false"
+    [[ ! "$type" =~ ^(string|int|bool|float|array|mixed)$ ]] && name="$type" && type="string"
+    [[ -z "$name" ]] && name="$type"
+  fi
+
+  PROP_NAMES+=("$name")
+  PROP_TYPES+=("$type")
+  PROP_VISIBILITIES+=("$visibility")
+  PROP_NULLABLES+=("$nullable")
+  PROP_IS_ELEMENT+=("$is_element")
+
+  if [[ "$is_element" == "true" && ! " ${ELEMENT_TYPES[*]} " =~ " $type " ]]; then
+    ELEMENT_TYPES+=("$type")
+  fi
+}
+
+# ============================================================
+# CATÁLOGO DE ELEMENTS (CONTRATO REAL)
+# ============================================================
+
+declare -A ELEMENT_PACKAGE_MAP=()
+declare -A ELEMENT_NAMESPACE_MAP=()
+
+load_elements_catalog() {
+  while IFS=',' read -r pkg ns _ _; do
+    local slug="$(basename "$pkg")"
+    local pascal="${ns##*\\}"
+
+    ELEMENT_PACKAGE_MAP["$pascal"]="$pkg"
+    ELEMENT_PACKAGE_MAP["$slug"]="$pkg"
+
+    ELEMENT_NAMESPACE_MAP["$pascal"]="$ns"
+    ELEMENT_NAMESPACE_MAP["$slug"]="$ns"
+  done < <(pkg-ls -f csv elements)
+}
+
+resolve_element_package() {
+  local etype="$1"
+  local slug
+  slug=$(echo "$etype" | sed 's/\([A-Z]\)/-\L\1/g' | sed 's/^-//')
+
+  [[ -n "${ELEMENT_PACKAGE_MAP[$etype]}" ]] && echo "${ELEMENT_PACKAGE_MAP[$etype]}" && return 0
+  [[ -n "${ELEMENT_PACKAGE_MAP[$slug]}"  ]] && echo "${ELEMENT_PACKAGE_MAP[$slug]}"  && return 0
+  return 1
+}
+
+# ============================================================
+# CREATE
+# ============================================================
+
+run_create() {
+  reset_props
+
+  local NAME_ARG=""
+  local PROPS_ARG=""
+  local OUTPUT=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      name:*)  NAME_ARG="${arg#name:}" ;;
+      props:*) PROPS_ARG="${arg#props:}" ;;
+      *)       OUTPUT="$arg" ;;
+    esac
+  done
+
+  OUTPUT="${OUTPUT:-$ENTITY_OUTPUT}"
+  [[ -z "$NAME_ARG" || -z "$PROPS_ARG" || ! -d "$OUTPUT" ]] && exit 1
+
+  local NAME="${NAME_ARG%%:*}"
+  local NS_SUFFIX="${NAME_ARG#*:}"
+  [[ "$NAME" == "$NS_SUFFIX" ]] && NS_SUFFIX="${NAME^}"
+
+  local ENT_PATH="$OUTPUT/$NAME"
+  local ENT_NS="Entities\\$NS_SUFFIX"
+
+  [[ -d "$ENT_PATH" ]] && exit 1
+  mkdir -p "$ENT_PATH/src"
+
+  echo "🔧 Criando entidade: $NAME"
+  echo "   Namespace: $ENT_NS"
+
+  parse_props "$PROPS_ARG"
+  load_elements_catalog
+
+  REPOS_JSON="[]"
+  REQUIRE_JSON="{\"php\":\"^8.3\""
+
+  add_dependency() {
+    local pkg="$1"
+    local path
+    path=$(cd "$WORK_DIR" && recompose path "$pkg") || return 1
+
+    REPOS_JSON="${REPOS_JSON%]}"
+    [[ "$REPOS_JSON" != "[" ]] && REPOS_JSON+=","
+    REPOS_JSON+="{\"type\":\"path\",\"url\":\"$path\",\"options\":{\"symlink\":true}}]"
+
+    REQUIRE_JSON="${REQUIRE_JSON%}"
+    REQUIRE_JSON+=",\"$pkg\":\"@dev\""
+  }
+
+  add_dependency "pocket/entity"
+  REQUIRE_JSON+="}"
+
+  echo ""
+  echo "📦 Resolvendo Elements..."
+
+  for etype in "${ELEMENT_TYPES[@]}"; do
+    pkg=$(resolve_element_package "$etype") \
+      || cleanup_and_exit "Element não encontrado no catálogo: $etype" "$ENT_PATH"
+
+    echo "   ➕ $pkg"
+    add_dependency "$pkg"
+  done
+
+  # ===============================
+  # GERAR ENTITY
+  # ===============================
+
+  local uses=""
+  local props=""
+
+  for etype in "${ELEMENT_TYPES[@]}"; do
+    ns="${ELEMENT_NAMESPACE_MAP[$etype]}"
+    class="Atom"
+    [[ "$etype" =~ Hash$ ]] && class="Hash"
+    uses+="use ${ns}\\${class} as ${etype};"$'\n'
+  done
+
+  for i in "${!PROP_NAMES[@]}"; do
+    props+="        ${PROP_VISIBILITIES[$i]} ${PROP_NULLABLES[$i]}${PROP_TYPES[$i]} \$${PROP_NAMES[$i]},"$'\n'
+  done
+
+  props="${props%,}"
+
+  cat > "$ENT_PATH/src/Entity.php" <<PHP
+<?php
+declare(strict_types=1);
+namespace ${ENT_NS};
+
+${uses}
+use Pocket\\Entity\\Abstracts\\Entity as AbstractEntity;
+
+final readonly class Entity extends AbstractEntity
+{
+    public function __construct(
+${props}
+    ) {}
+}
+PHP
+
+  cat > "$ENT_PATH/composer.json" <<JSON
+{
+  "name": "entities/$NAME",
+  "type": "library",
+  "autoload": { "psr-4": { "${ENT_NS//\\/\\\\}\\\\": "src/" } },
+  "repositories": $REPOS_JSON,
+  "require": $REQUIRE_JSON,
+  "minimum-stability": "dev"
+}
+JSON
+
+  cat > "$ENT_PATH/test.php" <<PHP
+<?php
+require __DIR__.'/vendor/autoload.php';
+use ${ENT_NS}\\Entity;
+new ReflectionClass(Entity::class);
+echo "✅ OK\n";
+PHP
+
+  (cd "$ENT_PATH" && composer update --no-interaction)
+  run_test "$ENT_PATH"
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
+[[ -z "$1" ]] && show_help && exit 0
+
+case "$1" in
+  test) run_test "$2" ;;
+  -h|--help|help) show_help ;;
+  *) run_create "$@" ;;
+esac
+#!/usr/bin/env bash
+set -e
+
+# ============================================================
+# CASSETE CLI - Gerador de Data Layers
+# ============================================================
+
+WORK_DIR="$(pwd)"
+CMD="$1"
+
+show_help() {
+  echo "CASSETE - Gerador de Data Layers"
+  echo ""
+  echo "uso:"
+  echo "  cassete <name>:<provider>:<entity>:<namespace> [destino]"
+  echo "  cassete test <path>"
+  echo "  cassete list [destino]                             lista data-layers gerados"
+  echo ""
+  echo "exemplos:"
+  echo "  cassete ecpf:mongo:entities/ecpf:eCPF ./data"
+  echo "  cassete test ./data/ecpf"
+  echo ""
+  echo "variáveis de ambiente:"
+  echo "  CASSETE_OUTPUT   diretório padrão para data"
+  echo "  CASSETE_PATH     diretório raiz do cassete (obrigatório)"
+  echo ""
+  echo "requer: recompose no PATH"
+}
+
+cleanup_and_exit() {
+  local msg="$1"
+  local path="$2"
+  echo "❌ $msg"
+  if [[ -n "$path" && -d "$path" ]]; then
+    rm -rf "$path"
+    echo "🧹 Removido: $path"
+  fi
+  exit 1
+}
+
+
+# ============================================================
+# COMANDO: LIST
+# ============================================================
+run_list() {
+  local SEARCH_PATH="${1:-$CASSETE_OUTPUT}"
+  
+  # Configuração de larguras (Manutenção Centralizada)
+  local W_NAME=15
+  local W_PROV=15
+  local W_NS=30
+  local W_ENT=20
+
+  # Função interna para truncar strings
+  truncate_str() {
+    local str="$1"
+    local max=$2
+    if [ ${#str} -gt $max ]; then
+      echo "${str:0:$((max-3))}..."
+    else
+      echo "$str"
+    fi
+  }
+
+  if [[ -z "$SEARCH_PATH" || ! -d "$SEARCH_PATH" ]]; then
+    echo "❌ Diretório não encontrado: $SEARCH_PATH"
+    exit 1
+  fi
+
+  echo "📂 Inventário de Data Layers"
+  echo ""
+  
+  # Cabeçalho dinâmico
+  printf "%-${W_NAME}s | %-${W_PROV}s | %-${W_NS}s | %-${W_ENT}s\n" "NOME" "PROVIDER" "NAMESPACE" "ENTIDADE"
+  printf "%.s-" $(seq 1 $((W_NAME + W_PROV + W_NS + W_ENT + 9)))
+  echo ""
+
+  for dir in "$SEARCH_PATH"/*; do
+    if [[ -d "$dir" && -f "$dir/composer.json" ]]; then
+      # Coleta de dados
+      local raw_name=$(basename "$dir")
+      local raw_prov=$(jq -r '.require | keys[] | select(contains("cassete/")) | select(. != "cassete/runtime")' "$dir/composer.json" | sed 's/cassete\///' | tr '\n' ',' | sed 's/,$//')
+      [[ -z "$raw_prov" ]] && raw_prov="custom"
+      
+      local raw_ns=$(jq -r '.autoload["psr-4"] // {} | keys[0] // "N/A"' "$dir/composer.json" | sed 's/\\$//')
+      
+      local raw_ent="N/A"
+      [[ -f "$dir/src/Factory.php" ]] && raw_ent=$(grep "use .*Entity;" "$dir/src/Factory.php" | awk '{print $2}' | sed 's/Entity;//')
+
+      # Exibição com truncamento preventivo
+      printf "%-${W_NAME}s | %-${W_PROV}s | %-${W_NS}s | %-${W_ENT}s\n" \
+        "$(truncate_str "$raw_name" $W_NAME)" \
+        "$(truncate_str "$raw_prov" $W_PROV)" \
+        "$(truncate_str "$raw_ns" $W_NS)" \
+        "$(truncate_str "$raw_ent" $W_ENT)"
+    fi
+  done
+}
+
+# ============================================================
+# COMANDO: TEST
+# ============================================================
+
+run_test() {
+  local DL_PATH="$1"
+  
+  if [[ -z "$DL_PATH" ]]; then
+    echo "uso: cassete test <path>"
+    exit 1
+  fi
+  
+  if [[ ! -d "$DL_PATH" ]]; then
+    echo "❌ Diretório não existe: $DL_PATH"
+    exit 1
+  fi
+  
+  if [[ ! -f "$DL_PATH/composer.json" ]]; then
+    echo "❌ Não é um data válido: $DL_PATH"
+    exit 1
+  fi
+  
+  echo "🧪 Testando data: $DL_PATH"
+  
+  local DL_NS=$(jq -r '.autoload["psr-4"] // {} | keys[0] // ""' "$DL_PATH/composer.json" | sed 's/\\$//')
+  
+  if [[ -z "$DL_NS" ]]; then
+    echo "❌ Namespace não encontrado"
+    exit 1
+  fi
+  
+  echo "   Namespace: $DL_NS"
+  
+  cat > "$DL_PATH/test.php" <<PHP
+<?php
+declare(strict_types=1);
+
+require __DIR__ . '/vendor/autoload.php';
+
+echo "🔍 Verificando autoload...\\n";
+
+\$documentClass = '${DL_NS}\\\\Document';
+\$gatewayClass = '${DL_NS}\\\\Gateway';
+\$factoryClass = '${DL_NS}\\\\Factory';
+
+if (!class_exists(\$documentClass)) {
+    echo "❌ Classe não encontrada: \$documentClass\\n";
+    exit(1);
+}
+echo "   ✅ \$documentClass\\n";
+
+if (!class_exists(\$gatewayClass)) {
+    echo "❌ Classe não encontrada: \$gatewayClass\\n";
+    exit(1);
+}
+echo "   ✅ \$gatewayClass\\n";
+
+if (!class_exists(\$factoryClass)) {
+    echo "❌ Classe não encontrada: \$factoryClass\\n";
+    exit(1);
+}
+echo "   ✅ \$factoryClass\\n";
+
+echo "🔍 Verificando herança...\\n";
+
+\$docRef = new ReflectionClass(\$documentClass);
+if (!\$docRef->isSubclassOf('Cassete\\\\Runtime\\\\Abstracts\\\\Document')) {
+    echo "❌ Document não extende AbstractDocument\\n";
+    exit(1);
+}
+echo "   ✅ Document extende AbstractDocument\\n";
+
+\$gwRef = new ReflectionClass(\$gatewayClass);
+if (!\$gwRef->isSubclassOf('Cassete\\\\Runtime\\\\Abstracts\\\\Gateway')) {
+    echo "❌ Gateway não extende AbstractGateway\\n";
+    exit(1);
+}
+echo "   ✅ Gateway extende AbstractGateway\\n";
+
+\$factRef = new ReflectionClass(\$factoryClass);
+if (!\$factRef->isSubclassOf('Pocket\\\\Entity\\\\Abstracts\\\\Factory')) {
+    echo "❌ Factory não extende AbstractFactory\\n";
+    exit(1);
+}
+echo "   ✅ Factory extende AbstractFactory\\n";
+
+echo "🔍 Verificando #[Attr]...\\n";
+
+\$docAttrs = \$docRef->getAttributes();
+if (empty(\$docAttrs)) {
+    echo "❌ Document sem #[Attr]\\n";
+    exit(1);
+}
+echo "   ✅ Document tem #[Attr]\\n";
+
+\$gwAttrs = \$gwRef->getAttributes();
+if (empty(\$gwAttrs)) {
+    echo "❌ Gateway sem #[Attr]\\n";
+    exit(1);
+}
+echo "   ✅ Gateway tem #[Attr]\\n";
+
+echo "\\n✅ Todos os testes passaram!\\n";
+PHP
+
+  echo ""
+  echo "📦 Executando teste..."
+  echo ""
+  
+  local TEST_OUTPUT
+  if TEST_OUTPUT=$(cd "$DL_PATH" && php test.php 2>&1); then
+    echo "$TEST_OUTPUT"
+    rm -f "$DL_PATH/test.php"
+    return 0
+  else
+    echo "$TEST_OUTPUT"
+    echo ""
+    echo "❌ Teste falhou"
+    rm -f "$DL_PATH/test.php"
+    return 1
+  fi
+}
+
+# ============================================================
+# COMANDO: CREATE
+# ============================================================
+
+run_create() {
+  local INPUT="$1"
+  local OUTPUT="${2:-$CASSETE_OUTPUT}"
+  
+  if [[ -z "$CASSETE_PATH" ]]; then
+    echo "❌ CASSETE_PATH não definido"
+    echo "ex: export CASSETE_PATH=/home/acioli/Clean/pockets/cassete"
+    exit 1
+  fi
+  
+  if [[ "$INPUT" != *":"*":"*":"* ]]; then
+    echo "❌ Formato inválido: $INPUT"
+    echo "uso: cassete <name>:<provider>:<entity>:<namespace>"
+    exit 1
+  fi
+  
+  if [[ -z "$OUTPUT" ]]; then
+    echo "❌ Destino não definido"
+    echo ""
+    echo "opções:"
+    echo "  cassete ecpf:mongo:entities/ecpf:eCPF ./data"
+    echo "  export CASSETE_OUTPUT=/path/to/data"
+    exit 1
+  fi
+  
+  if [[ ! -d "$OUTPUT" ]]; then
+    echo "❌ Diretório não existe: $OUTPUT"
+    exit 1
+  fi
+  
+  IFS=':' read -r NAME PROVIDER ENTITY DL_NS_SUFFIX <<< "$INPUT"
+  
+  DL_PATH="$OUTPUT/$NAME"
+  DL_NS="Data\\$DL_NS_SUFFIX"
+  
+  if [[ -d "$DL_PATH" ]]; then
+    echo "❌ Data já existe: $DL_PATH"
+    exit 1
+  fi
+  
+  mkdir -p "$DL_PATH/src"
+  
+  echo "🔧 Criando data: $NAME"
+  
+  # ============================================================
+  # RESOLVE DEPENDÊNCIAS (reativo)
+  # ============================================================
+  
+  REPOS_JSON="[]"
+  REQUIRE_JSON="{\"php\":\"^8.3\"}"
+  
+  add_dependency() {
+    local pkg="$1"
+    local pkg_path=""
+    
+    if [[ "$pkg" == "cassete/"* ]]; then
+      local subpkg="${pkg#cassete/}"
+      if [[ -d "$CASSETE_PATH/$subpkg" ]]; then
+        pkg_path="$CASSETE_PATH/$subpkg"
+      elif [[ -d "$CASSETE_PATH/providers/$subpkg" ]]; then
+        pkg_path="$CASSETE_PATH/providers/$subpkg"
+      fi
+    fi
+    
+    if [[ -z "$pkg_path" ]]; then
+      pkg_path=$(cd "$WORK_DIR" && recompose path "$pkg")
+    fi
+    
+    if [[ -z "$pkg_path" ]]; then
+      return 1
+    fi
+    
+    REPOS_JSON=$(echo "$REPOS_JSON" | sed 's/\]$//')
+    [[ "$REPOS_JSON" != "[" ]] && REPOS_JSON="$REPOS_JSON,"
+    REPOS_JSON="$REPOS_JSON{\"type\":\"path\",\"url\":\"$pkg_path\",\"options\":{\"symlink\":true}}]"
+    
+    REQUIRE_JSON=$(echo "$REQUIRE_JSON" | sed 's/\}$//')
+    REQUIRE_JSON="$REQUIRE_JSON,\"$pkg\":\"@dev\"}"
+    
+    return 0
+  }
+  
+  write_composer() {
+    local DL_NS_ESCAPED=$(echo "$DL_NS" | sed 's/\\/\\\\/g')
+    cat > "$DL_PATH/composer.json" <<JSON
+{
+    "name": "data/$NAME",
+    "type": "library",
+    "autoload": {
+        "psr-4": {
+            "${DL_NS_ESCAPED}\\\\": "src/"
+        }
+    },
+    "repositories": $REPOS_JSON,
+    "require": $REQUIRE_JSON,
+    "minimum-stability": "dev"
+}
+JSON
+  }
+  
+  write_sources() {
+    local entity_ns="$1"
+    
+    cat > "$DL_PATH/src/Document.php" <<PHP
+<?php
+declare(strict_types=1);
+namespace ${DL_NS};
+
+use Cassete\\Runtime\\Attributes\\Attr;
+use Cassete\\Runtime\\Abstracts\\Document as AbstractDocument;
+
+#[Attr(target: Factory::class)]
+readonly class Document extends AbstractDocument {}
+PHP
+
+    cat > "$DL_PATH/src/Gateway.php" <<PHP
+<?php
+declare(strict_types=1);
+namespace ${DL_NS};
+
+use Cassete\\Runtime\\Attributes\\Attr;
+use Cassete\\Runtime\\Abstracts\\Gateway as AbstractGateway;
+
+#[Attr(target: Document::class)]
+readonly class Gateway extends AbstractGateway {}
+PHP
+
+    cat > "$DL_PATH/src/Factory.php" <<PHP
+<?php
+declare(strict_types=1);
+namespace ${DL_NS};
+
+use ${entity_ns}Entity;
+use Pocket\\Entity\\Abstracts\\Factory as AbstractFactory;
+
+class Factory extends AbstractFactory {
+    protected static function entity(): string
+    {
+        return Entity::class;
+    }
+}
+PHP
+  }
+  
+  add_dependency "cassete/runtime" || cleanup_and_exit "Runtime não encontrado" "$DL_PATH"
+  add_dependency "cassete/$PROVIDER" || cleanup_and_exit "Provider não encontrado: $PROVIDER" "$DL_PATH"
+  add_dependency "$ENTITY" || cleanup_and_exit "Entidade não encontrada: $ENTITY" "$DL_PATH"
+  
+  ENTITY_NS=$(cd "$WORK_DIR" && recompose ns "$ENTITY")
+  
+  [[ -z "$ENTITY_NS" ]] && cleanup_and_exit "Namespace não encontrado para: $ENTITY" "$DL_PATH"
+  
+  write_sources "$ENTITY_NS"
+  write_composer
+  
+  echo "   Namespace: $DL_NS"
+  echo "   Runtime:   cassete/runtime"
+  echo "   Provider:  cassete/$PROVIDER"
+  echo "   Entity:    $ENTITY ($ENTITY_NS)"
+  echo ""
+  echo "📦 Resolvendo dependências..."
+  
+  MAX_ATTEMPTS=50
+  ATTEMPT=0
+  
+  while [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; do
+    ATTEMPT=$((ATTEMPT + 1))
+    
+    COMPOSER_OUTPUT=$(cd "$DL_PATH" && composer update --no-interaction 2>&1) && break
+    
+    MISSING=$(echo "$COMPOSER_OUTPUT" | grep -oP "[a-z0-9_-]+/[a-z0-9_-]+(?= @dev -> could not be found)" | head -1)
+    
+    if [[ -z "$MISSING" ]]; then
+      cleanup_and_exit "Erro não tratável:\n$COMPOSER_OUTPUT" "$DL_PATH"
+    fi
+    
+    echo "   ➕ [$ATTEMPT] $MISSING"
+    
+    if ! add_dependency "$MISSING"; then
+      cleanup_and_exit "Não foi possível resolver: $MISSING\n   rode 'recompose scan' pra verificar se existe" "$DL_PATH"
+    fi
+    
+    write_composer
+  done
+  
+  if [[ $ATTEMPT -ge $MAX_ATTEMPTS ]]; then
+    cleanup_and_exit "Máximo de tentativas atingido ($MAX_ATTEMPTS)" "$DL_PATH"
+  fi
+  
+  echo ""
+  echo "✅ data criado: $DL_PATH"
+  echo "   Dependências resolvidas em $ATTEMPT tentativa(s)"
+  
+  echo ""
+  run_test "$DL_PATH"
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if [[ -z "$CMD" ]]; then
+  show_help
+  exit 0
+fi
+
+case "$CMD" in
+  test)
+    run_test "$2"
+    ;;
+  list)
+    run_list "$2"
+    ;;
+  -h|--help|help)
+    show_help
+    ;;
+  *)
+    run_create "$CMD" "$2"
+    ;;
+esac
+#!/usr/bin/env bash
+set -e
+
+# ============================================================
+# ATOM CLI - Gerador de Elements (Atomic Value Objects)
+# ============================================================
+
+WORK_DIR="$(pwd)"
+
+show_help() {
+  echo "ATOM - Gerador de Elements"
+  echo ""
+  echo "uso:"
+  echo "  atom stub <name>:<namespace> [destino]"
+  echo "  atom test <path>"
+  echo ""
+  echo "exemplos:"
+  echo "  atom stub email ./elements"
+  echo "  atom stub pessoa-natureza:PessoaNatureza ./elements"
+  echo "  atom test ./elements/email"
+  echo ""
+  echo "variáveis de ambiente:"
+  echo "  ATOM_OUTPUT   diretório padrão para elements"
+  echo ""
+  echo "requer: recompose no PATH"
+}
+
+cleanup_and_exit() {
+  local msg="$1"
+  local path="$2"
+  echo "❌ $msg"
+  if [[ -n "$path" && -d "$path" ]]; then
+    rm -rf "$path"
+    echo "🧹 Removido: $path"
+  fi
+  exit 1
+}
+
+# ============================================================
+# COMANDO: TEST
+# ============================================================
+
+run_test() {
+  local EL_PATH="$1"
+  
+  if [[ -z "$EL_PATH" ]]; then
+    echo "uso: atom test <path>"
+    exit 1
+  fi
+  
+  if [[ ! -d "$EL_PATH" ]]; then
+    echo "❌ Diretório não existe: $EL_PATH"
+    exit 1
+  fi
+  
+  if [[ ! -f "$EL_PATH/test.php" ]]; then
+    echo "❌ Arquivo test.php não encontrado em: $EL_PATH"
+    exit 1
+  fi
+  
+  echo "🧪 Testando element: $EL_PATH"
+  echo ""
+  
+  local TEST_OUTPUT
+  if TEST_OUTPUT=$(cd "$EL_PATH" && php test.php 2>&1); then
+    echo "$TEST_OUTPUT"
+    return 0
+  else
+    echo "$TEST_OUTPUT"
+    echo ""
+    echo "❌ Teste falhou"
+    return 1
+  fi
+}
+
+# ============================================================
+# COMANDO: STUB
+# ============================================================
+
+run_stub() {
+  local NAME_ARG="$1"
+  local OUTPUT="${2:-$ATOM_OUTPUT}"
+  
+  if [[ -z "$NAME_ARG" ]]; then
+    echo "❌ name não definido"
+    echo "uso: atom stub <name>:<namespace> [destino]"
+    exit 1
+  fi
+  
+  if [[ -z "$OUTPUT" ]]; then
+    echo "❌ Destino não definido"
+    echo ""
+    echo "opções:"
+    echo "  atom stub email ./elements"
+    echo "  export ATOM_OUTPUT=/path/to/elements"
+    exit 1
+  fi
+  
+  if [[ ! -d "$OUTPUT" ]]; then
+    echo "❌ Diretório não existe: $OUTPUT"
+    exit 1
+  fi
+  
+  # Parse name:namespace
+  local NAME="${NAME_ARG%%:*}"
+  local NS_SUFFIX="${NAME_ARG#*:}"
+  
+  if [[ "$NAME" == "$NS_SUFFIX" ]]; then
+    # Só passou name, namespace = Name (PascalCase)
+    # Converte kebab-case para PascalCase
+    NS_SUFFIX=$(echo "$NAME" | sed -r 's/(^|-)([a-z])/\U\2/g')
+  fi
+  
+  local EL_PATH="$OUTPUT/$NAME"
+  local EL_NS="Elements\\$NS_SUFFIX"
+  local EXCEPTION_NAME="Invalid${NS_SUFFIX}Exception"
+  
+  if [[ -d "$EL_PATH" ]]; then
+    echo "❌ Element já existe: $EL_PATH"
+    exit 1
+  fi
+  
+  mkdir -p "$EL_PATH/src"
+  
+  echo "🔧 Criando element: $NAME"
+  echo "   Namespace: $EL_NS"
+  
+  # ============================================================
+  # RESOLVE DEPENDÊNCIAS (reativo)
+  # ============================================================
+  
+  REPOS_JSON="[]"
+  REQUIRE_JSON="{\"php\":\"^8.3\"}"
+  
+  add_dependency() {
+    local pkg="$1"
+    local pkg_path=""
+    
+    pkg_path=$(cd "$WORK_DIR" && recompose path "$pkg")
+    
+    if [[ -z "$pkg_path" ]]; then
+      return 1
+    fi
+    
+    REPOS_JSON=$(echo "$REPOS_JSON" | sed 's/\]$//')
+    [[ "$REPOS_JSON" != "[" ]] && REPOS_JSON="$REPOS_JSON,"
+    REPOS_JSON="$REPOS_JSON{\"type\":\"path\",\"url\":\"$pkg_path\",\"options\":{\"symlink\":true}}]"
+    
+    REQUIRE_JSON=$(echo "$REQUIRE_JSON" | sed 's/\}$//')
+    REQUIRE_JSON="$REQUIRE_JSON,\"$pkg\":\"@dev\"}"
+    
+    return 0
+  }
+  
+  write_composer() {
+    local EL_NS_ESCAPED=$(echo "$EL_NS" | sed 's/\\/\\\\/g')
+    cat > "$EL_PATH/composer.json" <<JSON
+{
+    "name": "elements/$NAME",
+    "description": "$NS_SUFFIX atomic value object",
+    "type": "library",
+    "license": "proprietary",
+    "autoload": {
+        "psr-4": {
+            "${EL_NS_ESCAPED}\\\\": "src/"
+        }
+    },
+    "repositories": $REPOS_JSON,
+    "require": $REQUIRE_JSON,
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
+JSON
+  }
+  
+  write_atom() {
+    cat > "$EL_PATH/src/Atom.php" <<PHP
+<?php
+declare(strict_types=1);
+namespace ${EL_NS};
+
+use Pocket\\Atom\\Abstracts\\Proton;
+use Pocket\\Atom\\Exceptions\\AtomException;
+
+final readonly class Atom extends Proton
+{
+    protected static function normalize(mixed \$value): string
+    {
+        // TODO: implementar normalização
+        return trim((string) \$value);
+    }
+
+    protected static function isValid(mixed \$value): bool
+    {
+        // TODO: implementar validação
+        return \$value !== '';
+    }
+
+    protected static function exception(
+        mixed \$raw,
+        mixed \$normalized
+    ): AtomException {
+        return new ${EXCEPTION_NAME}(
+            raw: \$raw,
+            normalized: \$normalized,
+            message: "Invalid ${NS_SUFFIX}: {\$raw}"
+        );
+    }
+}
+PHP
+  }
+  
+  write_exception() {
+    cat > "$EL_PATH/src/${EXCEPTION_NAME}.php" <<PHP
+<?php
+declare(strict_types=1);
+namespace ${EL_NS};
+
+use Pocket\\Atom\\Exceptions\\AtomException;
+
+final class ${EXCEPTION_NAME} extends AtomException {}
+PHP
+  }
+  
+  write_test() {
+    cat > "$EL_PATH/test.php" <<PHP
+<?php
+declare(strict_types=1);
+
+require __DIR__ . '/vendor/autoload.php';
+
+use ${EL_NS}\\Atom;
+use ${EL_NS}\\${EXCEPTION_NAME};
+
+echo "🔍 Verificando autoload...\\n";
+
+if (!class_exists(Atom::class)) {
+    echo "❌ Classe Atom não encontrada\\n";
+    exit(1);
+}
+echo "   ✅ Atom carregada\\n";
+
+if (!class_exists(${EXCEPTION_NAME}::class)) {
+    echo "❌ Classe ${EXCEPTION_NAME} não encontrada\\n";
+    exit(1);
+}
+echo "   ✅ ${EXCEPTION_NAME} carregada\\n";
+
+echo "🔍 Verificando herança...\\n";
+
+\$ref = new ReflectionClass(Atom::class);
+if (!\$ref->isSubclassOf('Pocket\\Atom\\Abstracts\\Proton')) {
+    echo "❌ Atom não extende Proton\\n";
+    exit(1);
+}
+echo "   ✅ Atom extende Proton\\n";
+
+\$exRef = new ReflectionClass(${EXCEPTION_NAME}::class);
+if (!\$exRef->isSubclassOf('Pocket\\Atom\\Exceptions\\AtomException')) {
+    echo "❌ ${EXCEPTION_NAME} não extende AtomException\\n";
+    exit(1);
+}
+echo "   ✅ ${EXCEPTION_NAME} extende AtomException\\n";
+
+echo "🔍 Verificando instanciação...\\n";
+
+try {
+    \$atom = Atom::from('test_value');
+    echo "   ✅ Atom::from() funciona\\n";
+    echo "   ✅ Valor: " . \$atom->value() . "\\n";
+} catch (${EXCEPTION_NAME} \$e) {
+    echo "   ⚠️  Atom::from('test_value') lançou exceção (validação customizada)\\n";
+}
+
+echo "\\n✅ Todos os testes passaram!\\n";
+echo "\\n📝 TODO: implementar normalize() e isValid() em src/Atom.php\\n";
+PHP
+  }
+  
+  # Adiciona pocket/atom
+  echo "📦 Resolvendo dependências..."
+  add_dependency "pocket/atom" || cleanup_and_exit "pocket/atom não encontrado" "$EL_PATH"
+  
+  write_atom
+  write_exception
+  write_composer
+  write_test
+  
+  # Roda composer (reativo)
+  MAX_ATTEMPTS=20
+  ATTEMPT=0
+  
+  while [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; do
+    ATTEMPT=$((ATTEMPT + 1))
+    
+    COMPOSER_OUTPUT=$(cd "$EL_PATH" && composer update --no-interaction 2>&1) && break
+    
+    MISSING=$(echo "$COMPOSER_OUTPUT" | grep -oP "[a-z0-9_-]+/[a-z0-9_-]+(?= @dev -> could not be found)" | head -1)
+    
+    if [[ -z "$MISSING" ]]; then
+      cleanup_and_exit "Erro não tratável:\n$COMPOSER_OUTPUT" "$EL_PATH"
+    fi
+    
+    echo "   ➕ [$ATTEMPT] $MISSING"
+    
+    if ! add_dependency "$MISSING"; then
+      cleanup_and_exit "Não foi possível resolver: $MISSING" "$EL_PATH"
+    fi
+    
+    write_composer
+  done
+  
+  if [[ $ATTEMPT -ge $MAX_ATTEMPTS ]]; then
+    cleanup_and_exit "Máximo de tentativas atingido ($MAX_ATTEMPTS)" "$EL_PATH"
+  fi
+  
+  echo ""
+  echo "✅ Element criado: $EL_PATH"
+  echo "   Dependências resolvidas em $ATTEMPT tentativa(s)"
+  
+  echo ""
+  run_test "$EL_PATH"
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if [[ -z "$1" ]]; then
+  show_help
+  exit 0
+fi
+
+case "$1" in
+  stub)
+    run_stub "$2" "$3"
+    ;;
+  test)
+    run_test "$2"
+    ;;
+  -h|--help|help)
+    show_help
+    ;;
+  *)
+    show_help
+    exit 1
+    ;;
+esac
+#!/usr/bin/env bash
+
+run_pkg_ls() {
+  local FORMAT="pretty"
+  local TARGET="."
+  local SHOW_HIDDEN=false
+  local DEPTH=4
+
+  # 1. Parsing de Argumentos
+  while [[ "$#" -gt 0 ]]; do
+    case $1 in
+      -f|--format) FORMAT="$2"; shift ;;
+      -a|--all)    SHOW_HIDDEN=true ;;
+      *)           TARGET="$1" ;;
+    esac
+    shift
+  done
+
+  # 2. Configuração de Busca
+  local FIND_OPTS=""
+  [ "$SHOW_HIDDEN" = false ] && FIND_OPTS="-not -path '*/.*'"
+  
+  local FILES=$(eval "find \"$TARGET\" -maxdepth $DEPTH -name 'composer.json' -not -path '*/vendor/*' $FIND_OPTS | sort")
+
+  if [ -z "$FILES" ]; then
+    echo "⚠️ Nenhum pacote encontrado."
+    return 0
+  fi
+
+  # 3. Inicialização de dados
+  local DATA_JSON="[]"
+
+  # Cabeçalho Pretty
+  if [[ "$FORMAT" == "pretty" ]]; then
+    local W_PRJ=25; local W_NS=35; local W_VER=10; local W_PTH=40
+    echo -e "\033[0;36m📦 Package Inspector: $TARGET (Depth: $DEPTH)\033[0m"
+    printf "\033[0;90m%-25s | %-35s | %-10s | %-40s\033[0m\n" "PROJECT" "NAMESPACE" "VERSION" "PATH"
+    echo "------------------------------------------------------------------------------------------------------------"
+  fi
+
+  while read -r composer_file; do
+    local dir=$(dirname "$composer_file")
+    
+    # Extração via jq (limpa e segura)
+    local name=$(jq -r '.name // "n/a"' "$composer_file")
+    local ns=$(jq -r '.autoload["psr-4"] // {} | keys[0] // "n/a"' "$composer_file" | sed 's/\\$//')
+    local ver=$(jq -r '.version // "dev-main"' "$composer_file")
+    local path=${dir#./}
+
+    case "$FORMAT" in
+      json)
+        # USA --arg para evitar erro de escape no Namespace
+        DATA_JSON=$(jq -n --argjson list "$DATA_JSON" \
+                          --arg name "$name" \
+                          --arg ns "$ns" \
+                          --arg ver "$ver" \
+                          --arg path "$path" \
+                    '$list + [{"project": $name, "namespace": $ns, "version": $ver, "path": $path}]')
+        ;;
+      csv)
+        echo "$name,$ns,$ver,$path"
+        ;;
+      tsv)
+        printf "%s\t%s\t%s\t%s\n" "$name" "$ns" "$ver" "$path"
+        ;;
+      *)
+        # Modo Pretty com truncamento manual simples
+        fmt_name=$( [[ ${#name} -gt 25 ]] && echo "${name:0:22}..." || echo "$name" )
+        fmt_ns=$( [[ ${#ns} -gt 35 ]] && echo "${ns:0:32}..." || echo "$ns" )
+        printf "%-25s | %-35s | %-10s | %-40s\n" "$fmt_name" "$fmt_ns" "$ver" "$path"
+        ;;
+    esac
+  done <<< "$FILES"
+
+  if [[ "$FORMAT" == "json" ]]; then
+    echo "$DATA_JSON"
+  fi
+}
+
+run_pkg_ls "$@"
+#!/bin/bash
+COPY_TO_CLIPBOARD=false
+FILE_TYPE=""
+
+# Parse das flags
+while [[ "$1" == -* ]]; do
+  case "$1" in
+    -c|--clip)
+      COPY_TO_CLIPBOARD=true
+      shift
+      ;;
+    -t|--type)
+      FILE_TYPE="$2"
+      shift 2
+      ;;
+    *)
+      echo "[cabron] flag desconhecida: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# Se especificou tipo, processa arquivos desse tipo no diretório atual
+if [ -n "$FILE_TYPE" ]; then
+  if [ ! -d "." ]; then
+    echo "[cabron] diretório atual inválido"
+    exit 1
+  fi
+  
+  OUTPUT=$(
+    echo "[cabron][type=$FILE_TYPE][begin]"
+    
+    find . -name "*.$FILE_TYPE" -not -path "*/vendor/*" | sort | while read -r FILE; do
+      case "$FILE_TYPE" in
+        php)
+          echo -n "[$FILE]" && php -w "$FILE" | tr -d '\n'
+          ;;
+        css)
+          echo -n "[$FILE]" && css -w "$FILE"
+          ;;
+        js)
+          echo -n "[$FILE]" && js -w "$FILE"
+          ;;
+        *)
+          echo -n "[$FILE]" && cat "$FILE" | tr -d '\n'
+          ;;
+      esac
+      echo ""
+    done
+    
+    echo "[cabron][end]"
+  )
+  
+  if [ "$COPY_TO_CLIPBOARD" == true ]; then
+    echo -n "$OUTPUT" | xclip -selection clipboard
+    echo "[cabron] copiado ($FILE_TYPE)"
+  else
+    echo "$OUTPUT"
+  fi
+  exit 0
+fi
+
+# Modo normal - precisa de argumentos
+if [ "$#" -lt 1 ]; then
+  echo "[cabron] uso: cabron [-c|--clip] [-t|--type ext] /dir1 /arquivo.php [/dir2 ...]"
+  exit 1
+fi
+
+OUTPUT=$(
+for TARGET in "$@"; do
+  # Arquivo individual .php
+  if [ -f "$TARGET" ] && [[ "$TARGET" == *.php ]]; then
+    echo "[cabron][file]"
+    echo -n "[$TARGET]" && php -w "$TARGET" | tr -d '\n'
+    echo "[cabron][end]"
+    continue
+  fi
+
+  # Arquivo individual .css
+  if [ -f "$TARGET" ] && [[ "$TARGET" == *.css ]]; then
+    echo "[cabron][file]"
+    echo -n "[$TARGET]" && css -w "$TARGET"
+    echo "[cabron][end]"
+    continue
+  fi
+
+  # Arquivo individual .js
+  if [ -f "$TARGET" ] && [[ "$TARGET" == *.js ]]; then
+    echo "[cabron][file]"
+    echo -n "[$TARGET]" && js -w "$TARGET"
+    echo "[cabron][end]"
+    continue
+  fi
+  
+  if [ ! -d "$TARGET" ]; then
+    echo "[cabron] item inválido: $TARGET"
+    continue
+  fi
+  
+  DIR="$TARGET"
+  COMPOSER="$(find "$DIR" -maxdepth 2 -name composer.json -print -quit)"
+  
+  if [ -z "$COMPOSER" ]; then
+    echo "[cabron] composer.json não encontrado em: $DIR"
+    continue
+  fi
+  
+  PACKAGE_NAME=$(jq -r '.name' "$COMPOSER" 2>/dev/null)
+  [ "$PACKAGE_NAME" == "null" ] && PACKAGE_NAME="unknown/package"
+  NAMESPACE=$(jq -r '.autoload["psr-4"] | to_entries[0].key' "$COMPOSER" 2>/dev/null)
+  [ "$NAMESPACE" == "null" ] && NAMESPACE="\\"
+  
+  # Contar arquivos PHP
+  FILE_COUNT=$(find "$DIR" -name "*.php" -not -path "*/vendor/*" | wc -l)
+  
+  # Detectar README
+  HAS_README="false"
+  if [ -f "$DIR/README.md" ]; then
+    HAS_README="true"
+  fi
+  
+  # Git remote
+  GIT_REMOTE=$(git -C "$DIR" config --get remote.origin.url 2>/dev/null)
+  
+  # Parse .env.example
+  ENV_LINE=""
+  if [ -f "$DIR/.env.example" ]; then
+    ENV_LINE=$(cat "$DIR/.env.example" | grep -v '^#' | grep -v '^\s*$' | grep '=' | tr '\n' ';' | sed 's/;$//')
+  fi
+  
+  echo "[cabron][begin]"
+  echo -n "[@package_name($PACKAGE_NAME)@namespace($NAMESPACE)@files($FILE_COUNT)@has_readme($HAS_README)"
+  
+  # Git remote
+  if [ -n "$GIT_REMOTE" ]; then
+    echo -n "@remote($GIT_REMOTE)"
+  fi
+  
+  # Env
+  if [ -n "$ENV_LINE" ]; then
+    echo -n "@env($ENV_LINE)"
+  fi
+  echo "]"
+  
+  # Executáveis PHP (#!/usr/bin/env php sem extensão .php)
+  if [ -d "$DIR/bin" ]; then
+    find "$DIR/bin" -type f -executable -not -name "*.php" 2>/dev/null | sort | while read -r EXEC; do
+      if head -n 1 "$EXEC" 2>/dev/null | grep -q '#!/usr/bin/env php'; then
+        echo -n "[$EXEC]" && php -w "$EXEC" | tr -d '\n'
+        echo ""
+      fi
+    done
+  fi
+  
+  # Arquivos .php normais
+  find "$DIR" -name "*.php" -not -path "*/vendor/*" | sort | while read -r FILE; do
+    echo -n "[$FILE]" && php -w "$FILE" | tr -d '\n'
+    echo ""
+  done
+  
+  # Composer
+  echo -n "[$COMPOSER]"
+  jq -c '.' "$COMPOSER" 2>/dev/null || cat "$COMPOSER" | tr -d '\n'
+  echo "[cabron][end]"
+done
+)
+
+if [ "$COPY_TO_CLIPBOARD" == true ]; then
+  echo -n "$OUTPUT" | xclip -selection clipboard
+  echo "[cabron] copiado"
+else
+  echo "$OUTPUT"
+fi
